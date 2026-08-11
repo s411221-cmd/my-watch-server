@@ -2,49 +2,72 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from linebot import LineBotApi
 from linebot.models import TextSendMessage
-import random
+from google import genai
+import os
 import uvicorn
 
-# 初始化 FastAPI 應用
-app = FastAPI(title="智慧手錶健康伺服器")
+app = FastAPI(title="AI 智慧健康手錶伺服器")
 
-# ==================== 1. 設定與金鑰 ====================
-# 請替換成你在 LINE Developers 後台申請到的 Channel Access Token
+# ==================== 1. 設定與金鑰設定 ====================
+# 請替換成你的 LINE Channel Access Token
 LINE_CHANNEL_ACCESS_TOKEN = "你的_LINE_CHANNEL_ACCESS_TOKEN"
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 
-# ==================== 2. 定義手錶傳過來的 JSON 格式 ====================
+# 請貼上你剛申請到的 Google Gemini API Key
+GEMINI_API_KEY = "你的_GEMINI_API_KEY"
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# ==================== 2. 手錶傳輸資料格式 ====================
 class SensorData(BaseModel):
     watch_id: str     # 手錶編號 (例如: "Watch_001")
-    temp: float       # 體溫 (例如: 38.2)
-    spo2: int         # 血氧 (例如: 91)
-    heart_rate: int   # 心率 (例如: 85)
+    temp: float       # 體溫
+    spo2: int         # 血氧
+    heart_rate: int   # 心率
 
-# ==================== 3. 資料庫：對照長輩與家屬的 LINE ID ====================
-# 在正式展示時，把對應的 LINE ID 填入此處
+# ==================== 3. 用戶資料庫 ====================
 USER_DATABASE = {
     "Watch_001": {
-        "user_line_id": "長輩的_LINE_USER_ID",   # 長輩的 LINE ID
-        "family_line_id": "家屬的_LINE_USER_ID"  # 家屬的 LINE ID
+        "user_line_id": "長輩的_LINE_USER_ID",
+        "family_line_id": "家屬的_LINE_USER_ID"
     }
 }
 
-# ==================== 4. 方案 B 專家措施庫 ====================
-MEASURES_DATABASE = {
-    "綠燈": [
-        "【健康報報】今日數據非常優秀，體溫與血氧都很正常喔！請繼續保持！",
-        "【健康報報】身體狀況良好，今天也別忘了適當補充水分喔！"
-    ],
-    "黃燈": [
-        "【健康提醒】體溫稍微偏高或血氧有些波動。請先坐下休息、喝杯溫水、放鬆心情喔！",
-        "【健康提醒】檢測到數據輕微異常，請保持室內空氣流通，稍後會再次為您記錄。"
-    ],
-    "紅燈": [
-        "🚨【緊急警告】系統偵測到您的生理數據發生嚴重異常（體溫過高或血氧過低）！請立刻坐正深呼吸，已同步緊急通知家屬！"
-    ]
-}
+# ==================== 4. AI 生成建議函式 ====================
+def generate_ai_advice(temp: float, spo2: int, heart_rate: int, status: str) -> str:
+    """呼叫 Gemini API 生成專屬的健康建議與警告"""
+    prompt = f"""
+你是一位專業、親切且有同理心的銀髮族家庭醫師助手。
+目前手錶量測到的長輩生理數據如下：
+- 燈號狀態：{status}
+- 體溫：{temp} °C
+- 血氧：{spo2} %
+- 心率：{heart_rate} 次/分
 
-# ==================== 5. 接收手錶數據的 API 網址 ====================
+請根據以上數據與燈號，為長輩撰寫一段溫馨且具體的健康建議與提醒。
+要求：
+1. 語氣要親切溫柔，適合長輩閱讀，繁體中文。
+2. 若為「綠燈」：給予讚美與日常保健小叮嚀（例如多喝水、適度散步），字數約 50~80 字。
+3. 若為「黃燈」：表達關心並給予具體緩和措施（例如坐下休息、補充溫水、保持通風），字數約 60~90 字。
+4. 若為「紅燈」：語氣要嚴謹但不過度恐慌，給予即時安撫與深呼吸指導，並告知已連線通知家屬，字數約 60~90 字。
+5. 不要輸出任何 Markdown 標題（如 ## 或 **），直接輸出文字即可。
+"""
+    try:
+        response = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
+        return response.text.strip()
+    except Exception as e:
+        print(f"AI 生成失敗：{e}")
+        # 若 AI API 故障，備用固定句子
+        if status == "綠燈":
+            return "【AI 健康提醒】今日生理數據非常優秀！請繼續保持愉快心情並多補充水分喔！"
+        elif status == "黃燈":
+            return "【AI 健康提醒】體溫或血氧稍微波動，請先坐下休息、喝杯溫水放鬆一下。"
+        else:
+            return "🚨【AI 緊急警告】數據顯示嚴重異常，請立刻坐正深呼吸，已連線緊急通知家屬！"
+
+# ==================== 5. 接收手錶數據 API ====================
 @app.post("/receive_sensor_data")
 async def receive_sensor_data(data: SensorData):
     watch_id = data.watch_id
@@ -52,46 +75,42 @@ async def receive_sensor_data(data: SensorData):
     spo2 = data.spo2
     hr = data.heart_rate
 
-    print(f"收到手錶 [{watch_id}] 數據 ➔ 體溫: {temp}°C | 血氧: {spo2}% | 心率: {hr}BPM")
+    print(f"收到手錶 [{watch_id}] 數據 ➔ 體溫: {temp}°C | 血氧: {spo2}% | 心率: {hr}")
 
-    # 檢查是否為註冊過的手錶
     if watch_id not in USER_DATABASE:
         raise HTTPException(status_code=404, detail="找不到此手錶 ID")
 
-    target_users = USER_DATABASE[watch_id]
-    user_id = target_users["user_line_id"]
-    family_id = target_users["family_line_id"]
-
-    # --- 方案 B：自製判斷邏輯 ---
+    target = USER_DATABASE[watch_id]
+    
+    # 判斷燈號
     status = "綠燈"
     if temp > 38.0 or spo2 < 90:
         status = "紅燈"
     elif temp > 37.3 or spo2 < 95:
         status = "黃燈"
 
-    # 從措施庫中隨機抽出一句溫馨叮嚀
-    advice = random.choice(MEASURES_DATABASE[status])
+    # 🤖 呼叫 Gemini AI 自動生成專屬叮嚀
+    ai_advice = generate_ai_advice(temp, spo2, hr, status)
 
     try:
-        # 1. 無論什麼燈號，先推播通知給「使用者本人」
-        user_msg = f"{advice}\n(目前數據：體溫 {temp}°C / 血氧 {spo2}% / 心率 {hr}BPM)"
-        line_bot_api.push_message(user_id, TextSendMessage(text=user_msg))
+        # 1. 傳送給長輩本人
+        user_msg = f"【AI 醫師叮嚀】\n{ai_advice}\n\n(📊 即時數據：體溫 {temp}°C / 血氧 {spo2}% / 心率 {hr}bpm)"
+        line_bot_api.push_message(target["user_line_id"], TextSendMessage(text=user_msg))
 
-        # 2. 如果亮「紅燈」，額外推播緊急警告給「家屬」
+        # 2. 若為紅燈，同步發送 AI 分析報告給家屬
         if status == "紅燈":
-            family_msg = f"🚨【家人緊急通知】\n您綁定的長輩手錶 [{watch_id}] 傳回危險警訊！\n即時數據：體溫 {temp}°C / 血氧 {spo2}%\n請立刻確認家人安全！"
-            line_bot_api.push_message(family_id, TextSendMessage(text=family_msg))
+            family_msg = f"🚨【家人緊急通知 - AI 評估報告】\n長輩手錶傳回異常警訊！\n即時數據：體溫 {temp}°C / 血氧 {spo2}% / 心率 {hr}bpm\n\n🤖 AI 醫師評估：\n{ai_advice}\n\n請立刻確認家人狀況！"
+            line_bot_api.push_message(target["family_line_id"], TextSendMessage(text=family_msg))
 
         return {
             "status": "success",
             "light_status": status,
-            "message": "數據已處理，LINE 訊息已發送"
+            "ai_advice": ai_advice
         }
 
     except Exception as e:
         print(f"LINE 發送失敗：{e}")
         return {"status": "error", "detail": str(e)}
 
-# ==================== 6. 本地啟動伺服器 ====================
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
