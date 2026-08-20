@@ -5,30 +5,34 @@ from linebot import LineBotApi
 from linebot.models import TextSendMessage
 from google import genai
 
-app = FastAPI(title="AI 智慧健康手錶伺服器")
+app = FastAPI(title="AI 智慧健康手錶伺服器（雙機器人版）")
 
-# ==================== 1. 設定與金鑰（從環境變數讀取） ====================
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_USER_ID = os.getenv("LINE_USER_ID", "")
+# ==================== 1. 設定與金鑰（雙機器人） ====================
+USER_BOT_TOKEN = os.getenv("USER_BOT_TOKEN", "")      # 配戴者機器人 Token
+FAMILY_BOT_TOKEN = os.getenv("FAMILY_BOT_TOKEN", "")  # 家屬機器人 Token
+
+USER_LINE_ID = os.getenv("USER_LINE_ID", "")          # 配戴者 LINE ID
+FAMILY_LINE_ID = os.getenv("FAMILY_LINE_ID", "")      # 家屬 LINE ID
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# 初始化 LINE SDK 與 Gemini Client
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
+# 初始化兩隻 LINE 機器人 SDK 與 Gemini Client
+user_line_bot = LineBotApi(USER_BOT_TOKEN) if USER_BOT_TOKEN else None
+family_line_bot = LineBotApi(FAMILY_BOT_TOKEN) if FAMILY_BOT_TOKEN else None
 ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # ==================== 2. 手錶傳輸資料格式 ====================
 class SensorData(BaseModel):
-    watch_id: str     # 手錶編號 (例如: "Watch_001")
+    watch_id: str     # 手錶編號
     temp: float       # 體溫
     spo2: int         # 血氧
     heart_rate: int   # 心率
 
 # ==================== 3. 用戶資料庫 ====================
-# 將 Watch_001 綁定到環境變數中設定的 LINE_USER_ID
 USER_DATABASE = {
     "Watch_001": {
-        "user_line_id": LINE_USER_ID,
-        "family_line_id": LINE_USER_ID  # 測試階段長輩與家屬皆可收到
+        "user_line_id": USER_LINE_ID,
+        "family_line_id": FAMILY_LINE_ID
     }
 }
 
@@ -42,7 +46,6 @@ def fallback_advice(status: str) -> str:
         return "🚨【AI 緊急警告】數據顯示嚴重異常，請立刻坐正深呼吸，已連線緊急通知家屬！"
 
 def generate_ai_advice(temp: float, spo2: int, heart_rate: int, status: str) -> str:
-    """呼叫 Gemini API 生成專屬健康建議"""
     if not ai_client:
         return fallback_advice(status)
 
@@ -75,7 +78,7 @@ def generate_ai_advice(temp: float, spo2: int, heart_rate: int, status: str) -> 
 # ==================== 5. 首頁測試用 API ====================
 @app.get("/")
 async def root():
-    return {"status": "online", "message": "AI 健康手錶伺服器正常運作中！"}
+    return {"status": "online", "message": "雙機器人 AI 健康手錶伺服器正常運作中！"}
 
 # ==================== 6. 接收手錶數據 API ====================
 @app.post("/receive_sensor_data")
@@ -84,8 +87,6 @@ async def receive_sensor_data(data: SensorData):
     temp = data.temp
     spo2 = data.spo2
     hr = data.heart_rate
-
-    print(f"收到手錶 [{watch_id}] 數據 ➔ 體溫: {temp}°C | 血氧: {spo2}% | 心率: {hr}")
 
     if watch_id not in USER_DATABASE:
         raise HTTPException(status_code=404, detail="找不到此手錶 ID")
@@ -103,17 +104,15 @@ async def receive_sensor_data(data: SensorData):
     ai_advice = generate_ai_advice(temp, spo2, hr, status)
 
     try:
-        if not line_bot_api:
-            raise HTTPException(status_code=500, detail="未設定 LINE_CHANNEL_ACCESS_TOKEN")
+        # 1. 透過【配戴者機器人】傳送給長輩本人
+        if user_line_bot and target["user_line_id"]:
+            user_msg = f"【AI 醫師叮嚀】\n{ai_advice}\n\n(📊 即時數據：體溫 {temp}°C / 血氧 {spo2}% / 心率 {hr}bpm)"
+            user_line_bot.push_message(target["user_line_id"], TextSendMessage(text=user_msg))
 
-        # 1. 傳送給長輩本人
-        user_msg = f"【AI 醫師叮嚀】\n{ai_advice}\n\n(📊 即時數據：體溫 {temp}°C / 血氧 {spo2}% / 心率 {hr}bpm)"
-        line_bot_api.push_message(target["user_line_id"], TextSendMessage(text=user_msg))
-
-        # 2. 若為紅燈，同步發送 AI 分析報告給家屬
-        if status == "紅燈":
-            family_msg = f"🚨【家人緊急通知 - AI 評估報告】\n長輩手錶傳回異常警訊！\n即時數據：體溫 {temp}°C / 血氧 {spo2}% / 心率 {hr}bpm\n\n🤖 AI 醫師評估：\n{ai_advice}\n\n請立刻確認家人狀況！"
-            line_bot_api.push_message(target["family_line_id"], TextSendMessage(text=family_msg))
+        # 2. 若數據異常（黃燈或紅燈），透過【家屬機器人】發送報告給家屬
+        if status in ["黃燈", "紅燈"] and family_line_bot and target["family_line_id"]:
+            family_msg = f"🚨【長輩健康警訊通知】\n手錶 [{watch_id}] 傳回異常數據！\n\n- 狀態：{status}\n- 體溫：{temp}°C\n- 血氧：{spo2}%\n- 心率：{hr}bpm\n\n🤖 AI 醫師分析：\n{ai_advice}\n\n請盡快確認長輩狀況！"
+            family_line_bot.push_message(target["family_line_id"], TextSendMessage(text=family_msg))
 
         return {
             "status": "success",
