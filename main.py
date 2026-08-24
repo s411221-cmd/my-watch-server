@@ -22,7 +22,30 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 genai.configure(api_key=GEMINI_API_KEY)
 
 # 採用最新穩定模型版本
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+# 自動偵測並載入你帳號內「唯一可用」的 Gemini 模型
+def get_working_model():
+    try:
+        models = [
+            m.name for m in genai.list_models() 
+            if 'generateContent' in m.supported_generation_methods
+        ]
+        # 優先找包含 flash 的模型
+        for m in models:
+            if 'flash' in m:
+                print(f"成功自動匹配模型：{m}")
+                return genai.GenerativeModel(m)
+        # 若無 flash，抓取第一個支援的模型
+        if models:
+            print(f"成功自動匹配模型：{models[0]}")
+            return genai.GenerativeModel(models[0])
+    except Exception as e:
+        print(f"模型自動偵測失敗: {e}")
+    
+    # 備用保險寫法
+    return genai.GenerativeModel('models/gemini-1.5-flash')
+
+# 執行自動匹配
+gemini_model = get_working_model()
 
 # 全域變數：儲存 ESP32 傳來的最新感測器數據
 latest_sensor_data = {
