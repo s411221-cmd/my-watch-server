@@ -22,7 +22,7 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 genai.configure(api_key=GEMINI_API_KEY)
 
 # 採用最新穩定模型版本
-gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
 # 全域變數：儲存 ESP32 傳來的最新感測器數據
 latest_sensor_data = {
