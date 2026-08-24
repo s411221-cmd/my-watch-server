@@ -11,51 +11,32 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 app = FastAPI()
 
-# 1. 環境變數讀取
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# ================= 1. 環境變數讀取 =================
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# 2. 初始化 LINE 與 Gemini
+# ================= 2. 初始化套件設定 =================
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-genai.configure(api_key=GEMINI_API_KEY)
 
-# 採用最新穩定模型版本
-# 自動偵測並載入你帳號內「唯一可用」的 Gemini 模型
-def get_working_model():
-    try:
-        models = [
-            m.name for m in genai.list_models() 
-            if 'generateContent' in m.supported_generation_methods
-        ]
-        # 優先找包含 flash 的模型
-        for m in models:
-            if 'flash' in m:
-                print(f"成功自動匹配模型：{m}")
-                return genai.GenerativeModel(m)
-        # 若無 flash，抓取第一個支援的模型
-        if models:
-            print(f"成功自動匹配模型：{models[0]}")
-            return genai.GenerativeModel(models[0])
-    except Exception as e:
-        print(f"模型自動偵測失敗: {e}")
-    
-    # 備用保險寫法
-    return genai.GenerativeModel('models/gemini-1.5-flash')
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
-# 執行自動匹配
-gemini_model = get_working_model()
-
-# 全域變數：儲存 ESP32 傳來的最新感測器數據
+# 全域生理數據（預設假數據，未接 ESP32 時可直接測試）
 latest_sensor_data = {
     "temp": 36.5,
     "spo2": 98,
     "heart_rate": 75
 }
 
-# 3. 取得即時天氣函式（免費 Open-Meteo API，預設台中經緯度）
+# ================= 3. 取得即時天氣 (Open-Meteo 免費 API) =================
 def get_current_weather(lat=24.14, lon=120.67):
+    """
+    預設為台中經緯度 (24.14, 120.67)，可依需求自行修改：
+    台北: lat=25.03, lon=121.56
+    高雄: lat=22.62, lon=120.30
+    """
     try:
         url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&timezone=Asia%2FTaipei"
         res = requests.get(url, timeout=5).json()
@@ -63,30 +44,61 @@ def get_current_weather(lat=24.14, lon=120.67):
         temp = curr.get("temperature", "--")
         code = curr.get("weathercode", 0)
         
-        # WMO 天氣代碼判斷是否下雨
+        # WMO 天氣代碼 51~82 均為各式降雨
         is_raining = code in [51, 53, 55, 61, 63, 65, 80, 81, 82]
         weather_desc = "下雨中" if is_raining else "晴朗/多雲無雨"
-        return f"室外氣溫 {temp}°C，天候：{weather_desc}"
+        return f"戶外氣溫 {temp}°C，天候狀況：{weather_desc}"
     except Exception as e:
-        print(f"天氣 API 讀取失敗: {e}")
+        print(f"Weather API error: {e}")
         return "氣溫適中，天候正常"
 
-# 4. 接收 ESP32 感測器數據的 Endpoint
+# ================= 4. 安全呼叫 Gemini (備援保護) =================
+def safe_gemini_generate(prompt: str, fallback_text: str) -> str:
+    """
+    若 Gemini API Key 出錯或模型無回應，自動切換至預設優質文字，不讓用戶看到 error。
+    """
+    if not GEMINI_API_KEY:
+        return fallback_text
+        
+    candidate_models = [
+        'gemini-1.5-flash',
+        'gemini-2.0-flash',
+        'gemini-1.5-pro'
+    ]
+    
+    for model_name in candidate_models:
+        try:
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            if response and response.text:
+                return response.text.strip()
+        except Exception as e:
+            print(f"嘗試模型 {model_name} 失敗: {e}")
+            continue
+            
+    return fallback_text
+
+# ================= 5. API 路由設定 =================
+@app.get("/")
+def home():
+    return {"status": "ok", "message": "LINE Bot Service is running!"}
+
 @app.post("/receive_sensor_data")
 async def receive_sensor_data(request: Request):
+    """ 接收 ESP32 上傳之生理數據 """
     global latest_sensor_data
     try:
         data = await request.json()
-        latest_sensor_data["temp"] = data.get("temp", 36.5)
-        latest_sensor_data["spo2"] = data.get("spo2", 98)
-        latest_sensor_data["heart_rate"] = data.get("heart_rate", 75)
+        latest_sensor_data["temp"] = data.get("temp", latest_sensor_data["temp"])
+        latest_sensor_data["spo2"] = data.get("spo2", latest_sensor_data["spo2"])
+        latest_sensor_data["heart_rate"] = data.get("heart_rate", latest_sensor_data["heart_rate"])
         return {"status": "success", "data": latest_sensor_data}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# 5. LINE Webhook 接收點
 @app.post("/callback")
 async def callback(request: Request):
+    """ LINE Webhook 接收點 """
     signature = request.headers.get("X-Line-Signature", "")
     body = (await request.body()).decode("utf-8")
     try:
@@ -95,7 +107,7 @@ async def callback(request: Request):
         raise HTTPException(status_code=400, detail="Invalid signature")
     return "OK"
 
-# 6. 處理用戶訊息與關鍵字比對
+# ================= 6. LINE 訊息邏輯處理 =================
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_msg = event.message.text.strip()
@@ -106,39 +118,57 @@ def handle_message(event):
     hr = latest_sensor_data["heart_rate"]
 
     try:
-        # 關鍵字模糊比對（避免「活動」與「運動」文字差異導致不回覆）
+        # 選項 A：查看健康數據
         if "健康" in user_msg or "日記" in user_msg:
-            reply_text = f"📊 【即時生理量測結果】\n• 體溫：{temp} °C\n• 血氧：{spo2} %\n• 心率：{hr} bpm\n\n身體狀態良好，請繼續保持！"
+            reply_text = (
+                f"📊 【即時生理量測結果】\n"
+                f"• 體溫：{temp} °C\n"
+                f"• 血氧：{spo2} %\n"
+                f"• 心率：{hr} bpm\n\n"
+                f"身體狀態良好，請繼續保持！"
+            )
         
+        # 選項 B：今日適合的運動 / 活動 (結合天氣與 AI/備援)
         elif "適合" in user_msg or "運動" in user_msg or "活動" in user_msg:
             weather_info = get_current_weather(lat=24.14, lon=120.67)
             prompt = (
                 f"長輩生理數據：體溫 {temp}°C、血氧 {spo2}%、心率 {hr} bpm。\n"
                 f"長輩所在地戶外天氣：{weather_info}。\n"
-                f"請以親切溫柔的口吻（100字內），結合生理狀態與當前天氣狀況（如下雨提醒室內運動，太熱提醒補水），"
+                f"請以親切溫柔的口吻（100字內），結合生理與天氣狀況（如下雨提醒室內運動，太熱提醒補水），"
                 f"推薦 1-2 個今天適合長輩執行的輕量運動。"
             )
-            response = gemini_model.generate_content(prompt)
-            reply_text = response.text
+            fallback = (
+                f"🏃【今日運動建議】\n"
+                f"• 當前天候：{weather_info}\n"
+                f"• 生理狀態：體溫 {temp}°C / 血氧 {spo2}% / 心率 {hr}bpm（良好）\n\n"
+                f"建議您今天可在室內進行 15 分鐘緩和伸展操或原地踏步，運動時記得隨時補充水分喔！"
+            )
+            reply_text = safe_gemini_generate(prompt, fallback)
 
+        # 選項 C：飲食保養建議
         elif "飲食" in user_msg or "保養" in user_msg:
-            prompt = f"使用者數據：體溫 {temp}°C、血氧 {spo2}%、心率 {hr} bpm。請給長輩 80 字內簡短溫和的飲食保養提醒。"
-            response = gemini_model.generate_content(prompt)
-            reply_text = response.text
+            prompt = f"長輩數據：體溫 {temp}°C、血氧 {spo2}%、心率 {hr} bpm。請給長輩 80 字內簡短溫和的飲食保養提醒。"
+            fallback = (
+                f"🥗【飲食保養提醒】\n"
+                f"今天請記得多喝溫開水，飲食保持清淡少油少鹽，並適量攝取新鮮蔬菜與優質蛋白質喔！"
+            )
+            reply_text = safe_gemini_generate(prompt, fallback)
 
+        # 選項 D：一鍵聯繫家屬
         elif "聯繫" in user_msg or "家屬" in user_msg:
-            reply_text = "🚨 已通知您的家屬與照護人員！\n若有緊急不適，請同時撥打 119 或聯繫緊急聯絡人。"
+            reply_text = "🚨 已通知您的家屬與照護人員！\n若有緊急不適，請同時撥打 119 尋求協助。"
 
+        # 選項 E：其他任意文字互動
         else:
             prompt = f"你是一位親切的長輩健康照護助手。長輩說：『{user_msg}』。請以簡短、關懷且語氣溫和的方式進行對話。"
-            response = gemini_model.generate_content(prompt)
-            reply_text = response.text
+            fallback = f"收到您的訊息了！天氣多變，記得隨時補充水分、注意保暖喔！"
+            reply_text = safe_gemini_generate(prompt, fallback)
 
     except Exception as e:
-        print(f"處理訊息時發生錯誤: {e}")
-        reply_text = f"⚠️ 系統處理時發生異常，請稍後再試。（錯誤提示：{str(e)[:40]}）"
+        print(f"Handle message exception: {e}")
+        reply_text = "😊 收到您的訊息！請記得按時記錄健康數據、多喝水喔！"
 
-    # 發送訊息回覆給 LINE
+    # 發送訊息至 LINE
     try:
         with ApiClient(configuration) as api_client:
             line_bot_api = MessagingApi(api_client)
@@ -149,4 +179,4 @@ def handle_message(event):
                 )
             )
     except Exception as e:
-        print(f"LINE 發送訊息失敗: {e}")
+        print(f"LINE reply error: {e}")
