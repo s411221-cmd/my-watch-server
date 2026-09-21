@@ -1,206 +1,144 @@
 import os
-import requests
-import google.generativeai as genai
+import json
+import asyncio
+import httpx
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage, PushMessageRequest
+    Configuration, ApiClient, MessagingApi, ReplyMessageRequest,
+    TextMessage, FlexMessage, FlexContainer, QuickReply, QuickReplyItem, MessageAction
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
+import google.generativeai as genai
 
-app = FastAPI()
+# ===== 1. 環境變數設定 =====
+LINE_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")
 
-# ================= 1. 環境變數讀取 (完全對應 Render 設定) =================
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_SECRET)
+genai.configure(api_key=GEMINI_KEY)
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
-# 家屬端機器人與家屬 LINE ID 變數
-FAMILY_BOT_TOKEN = os.getenv("FAMILY_BOT_TOKEN", "")
-FAMILY_LINE_ID = os.getenv("FAMILY_LINE_ID", "")
-USER_LINE_ID = os.getenv("USER_LINE_ID", "")
+# 全局變數保存最新生理數據
+latest_telemetry = {"temp": 36.5, "heart_rate": 75, "spo2": 98}
 
-# ================= 2. 初始化 LINE 與 Gemini 設定 =================
-configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+# ===== 2. 背景 Keep-Alive 任務 =====
+async def keep_alive_task():
+    """每 10 分鐘自動對自己發送 GET 請求，防止 Render 免費版進入休眠"""
+    async with httpx.AsyncClient() as client:
+        while True:
+            await asyncio.sleep(600)
+            try:
+                res = await client.get(f"{RENDER_URL}/api/v1/healthz")
+                print(f"[Keep-Alive] Ping 心跳成功, Status: {res.status_code}")
+            except Exception as e:
+                print(f"[Keep-Alive] Ping 失敗: {e}")
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(keep_alive_task())
+    yield
 
-# 全域生理數據（預設假數據，未接 ESP32 時自動使用）
-latest_sensor_data = {
-    "temp": 36.5,
-    "spo2": 98,
-    "heart_rate": 75
-}
+app = FastAPI(lifespan=lifespan)
 
-# ================= 3. 取得即時天氣 (Open-Meteo API) =================
-def get_current_weather(lat=24.14, lon=120.67):
-    """ 預設為台中經緯度 (24.14, 120.67) """
-    try:
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true&timezone=Asia%2FTaipei"
-        res = requests.get(url, timeout=5).json()
-        curr = res.get("current_weather", {})
-        temp = curr.get("temperature", "--")
-        code = curr.get("weathercode", 0)
-        
-        # WMO 天氣代碼 51~82 均為各式降雨
-        is_raining = code in [51, 53, 55, 61, 63, 65, 80, 81, 82]
-        weather_desc = "下雨中" if is_raining else "晴朗/多雲無雨"
-        return f"戶外氣溫 {temp}°C，天候狀況：{weather_desc}"
-    except Exception as e:
-        print(f"Weather API error: {e}")
-        return "氣溫適中，天候正常"
+# ===== 3. API Endpoints =====
+@app.get("/api/v1/healthz")
+async def health_check():
+    return {"status": "healthy", "service": "health-watch-backend"}
 
-# ================= 4. 安全呼叫 Gemini (雙重模型備援機制) =================
-def safe_gemini_generate(prompt: str, fallback_text: str) -> str:
-    if not GEMINI_API_KEY:
-        return fallback_text
-        
-    candidate_models = [
-        'gemini-1.5-flash',
-        'gemini-2.0-flash',
-        'gemini-1.5-pro'
-    ]
+@app.post("/api/v1/telemetry")
+async def receive_telemetry(data: dict):
+    global latest_telemetry
+    latest_telemetry["temp"] = data.get("temp", 36.5)
+    latest_telemetry["heart_rate"] = data.get("heart_rate", 75)
+    latest_telemetry["spo2"] = data.get("spo2", 98)
+    return {"status": "success", "data_received": latest_telemetry}
+
+# ===== 4. AI 飲食與運動建議產生器 =====
+def generate_ai_advice(category: str, symptom: str = "無症狀") -> str:
+    temp = latest_telemetry["temp"]
+    hr = latest_telemetry["heart_rate"]
     
-    for model_name in candidate_models:
-        try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt)
-            if response and response.text:
-                return response.text.strip()
-        except Exception as e:
-            print(f"嘗試模型 {model_name} 失敗: {e}")
-            continue
-            
-    return fallback_text
+    prompt = f"""
+    你是一位溫柔專業的家庭醫師與營養師。請根據使用者當前數據與需求，給予溫馨且具體的保養建議：
+    【類別】: {category}
+    【即時數據】: 體溫 {temp} °C, 心率 {hr} bpm
+    【主訴狀況】: {symptom}
+    
+    【要求】:
+    1. 針對數據與症狀給予 2-3 點具體建議（若體溫 > 37.5°C 須提醒補充水分與休息）。
+    2. 語氣體貼親切，控制在 120 字以內。
+    """
+    response = gemini_model.generate_content(prompt)
+    return response.text.strip()
 
-# ================= 5. API 路由設定 =================
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "AI Health Assistant is running!"}
+def build_flex_card(title: str, advice: str) -> FlexContainer:
+    temp = latest_telemetry["temp"]
+    hr = latest_telemetry["heart_rate"]
+    bg_color = "#2E7D32" if "飲食" in title else "#E65100"
+    
+    card_json = {
+        "type": "bubble",
+        "header": {
+            "type": "box", "layout": "vertical", "backgroundColor": bg_color,
+            "contents": [{"type": "text", "text": title, "weight": "bold", "color": "#FFFFFF", "size": "md"}]
+        },
+        "body": {
+            "type": "box", "layout": "vertical",
+            "contents": [
+                {"type": "text", "text": f"當前數據：體溫 {temp}°C | 心率 {hr} bpm", "size": "xs", "color": "#666666"},
+                {"type": "separator", "margin": "md"},
+                {"type": "text", "text": "💡 AI 醫師指導建議：", "weight": "bold", "margin": "md", "size": "sm"},
+                {"type": "text", "text": advice, "wrap": True, "size": "xs", "color": "#333333", "margin": "sm"}
+            ]
+        }
+    }
+    return FlexContainer.from_dict(card_json)
 
-@app.post("/receive_sensor_data")
-async def receive_sensor_data(request: Request):
-    """ 接收 ESP32 上傳之生理數據 """
-    global latest_sensor_data
-    try:
-        data = await request.json()
-        latest_sensor_data["temp"] = data.get("temp", latest_sensor_data["temp"])
-        latest_sensor_data["spo2"] = data.get("spo2", latest_sensor_data["spo2"])
-        latest_sensor_data["heart_rate"] = data.get("heart_rate", latest_sensor_data["heart_rate"])
-        return {"status": "success", "data": latest_sensor_data}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
+# ===== 5. LINE Bot Webhook 處理器 =====
 @app.post("/callback")
-async def callback(request: Request):
-    """ 長輩端 LINE Webhook 接收點 """
+async def line_callback(request: Request):
     signature = request.headers.get("X-Line-Signature", "")
-    body = (await request.body()).decode("utf-8")
+    body = await request.body()
     try:
-        handler.handle(body, signature)
+        handler.handle(body.decode("utf-8"), signature)
     except InvalidSignatureError:
         raise HTTPException(status_code=400, detail="Invalid signature")
     return "OK"
 
-# ================= 6. LINE 訊息邏輯處理 =================
 @handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
-    user_msg = event.message.text.strip()
-    reply_text = ""
+def handle_text(event):
+    text = event.message.text.strip()
+    reply_token = event.reply_token
 
-    temp = latest_sensor_data["temp"]
-    spo2 = latest_sensor_data["spo2"]
-    hr = latest_sensor_data["heart_rate"]
+    with ApiClient(configuration) as api_client:
+        messaging_api = MessagingApi(api_client)
 
-    try:
-        # 功能 A：心率 / 生理數據檢測
-        if "健康" in user_msg or "日記" in user_msg or "心率" in user_msg or "檢測" in user_msg:
-            reply_text = (
-                f"📊 【即時生理量測結果】\n"
-                f"• 體溫：{temp} °C\n"
-                f"• 血氧：{spo2} %\n"
-                f"• 心率：{hr} bpm\n\n"
-                f"身體狀態良好，請繼續保持！"
-            )
-        
-        # 功能 B：今日適合的運動 / 活動 (結合氣候與 AI)
-        elif "適合" in user_msg or "運動" in user_msg or "活動" in user_msg:
-            weather_info = get_current_weather(lat=24.14, lon=120.67)
-            prompt = (
-                f"長輩生理數據：體溫 {temp}°C、血氧 {spo2}%、心率 {hr} bpm。\n"
-                f"長輩所在地戶外天氣：{weather_info}。\n"
-                f"請以親切溫柔的口吻（100字內），結合生理與天氣狀況（如下雨提醒室內運動，太熱提醒補水），"
-                f"推薦 1-2 個今天適合長輩執行的輕量運動。"
-            )
-            fallback = (
-                f"🏃【今日專屬運動建議】\n"
-                f"• 當前天候：{weather_info}\n"
-                f"• 生理狀態：體溫 {temp}°C / 血氧 {spo2}% / 心率 {hr}bpm（良好）\n\n"
-                f"建議您今天可在室內進行 15 分鐘緩和伸展操或原地踏步，運動時記得隨時補充水分喔！"
-            )
-            reply_text = safe_gemini_generate(prompt, fallback)
+        # A. 點擊「今日適合的運動」
+        if text == "今日適合的運動":
+            advice = generate_ai_advice("運動建議")
+            card = build_flex_card("🏃 今日專屬運動建議", advice)
+            messaging_api.reply_message(ReplyMessageRequest(replyToken=reply_token, messages=[FlexMessage(altText="運動建議", contents=card)]))
 
-        # 功能 C：飲食保養提醒
-        elif "飲食" in user_msg or "保養" in user_msg:
-            prompt = f"長輩數據：體溫 {temp}°C、血氧 {spo2}%、心率 {hr} bpm。請給長輩 80 字內簡短溫和的飲食保養提醒。"
-            fallback = (
-                f"🥗【飲食保養提醒】\n"
-                f"今天請記得多喝溫開水，飲食保持清淡少油少鹽，並適量攝取新鮮蔬菜與優質蛋白質喔！"
-            )
-            reply_text = safe_gemini_generate(prompt, fallback)
+        # B. 點擊「飲食保養建議」➔ 觸發 Quick Reply 詢問症狀
+        elif text == "飲食保養建議":
+            qr = QuickReply(items=[
+                QuickReplyItem(action=MessageAction(label="😊 無症狀/狀況良好", text="飲食調查:無症狀")),
+                QuickReplyItem(action=MessageAction(label="🤢 胃口差/腸胃不適", text="飲食調查:腸胃不適")),
+                QuickReplyItem(action=MessageAction(label="😴 頭暈/疲勞倦怠", text="飲食調查:頭暈疲勞")),
+                QuickReplyItem(action=MessageAction(label="🤒 喉嚨痛/發燒感", text="飲食調查:發燒不適"))
+            ])
+            msg = TextMessage(text="請選擇您目前是否有任何身體狀況，AI 營養師將為您評估最合適的飲食：", quick_reply=qr)
+            messaging_api.reply_message(ReplyMessageRequest(replyToken=reply_token, messages=[msg]))
 
-        # 功能 D：一鍵聯繫家屬（經由家屬端機器人推播通知）
-        elif "聯繫" in user_msg or "家屬" in user_msg:
-            reply_text = "🚨 已即時發送通知給您的家屬！\n若有緊急不適，請同時撥打 119 尋求協助。"
-            
-            # 使用家屬端機器人 Token 與家屬 ID 發送推播
-            if FAMILY_BOT_TOKEN and FAMILY_LINE_ID:
-                try:
-                    family_config = Configuration(access_token=FAMILY_BOT_TOKEN)
-                    push_content = (
-                        f"🚨 【長輩安危關懷通知】\n"
-                        f"長輩剛才點擊了「一鍵聯繫家屬」！\n\n"
-                        f"📊 【即時生理數據】\n"
-                        f"• 體溫：{temp} °C\n"
-                        f"• 血氧：{spo2} %\n"
-                        f"• 心率：{hr} bpm\n\n"
-                        f"請儘速與長輩聯繫關心狀況。"
-                    )
-                    
-                    with ApiClient(family_config) as family_api_client:
-                        family_bot_api = MessagingApi(family_api_client)
-                        family_bot_api.push_message(
-                            PushMessageRequest(
-                                to=FAMILY_LINE_ID,
-                                messages=[TextMessage(text=push_content)]
-                            )
-                        )
-                    print("已成功發送通知至家屬端機器人！")
-                except Exception as push_err:
-                    print(f"家屬端機器人發送推播失敗: {push_err}")
-
-        # 功能 E：一般對話
-        else:
-            prompt = f"你是一位親切的長輩健康照護助手。長輩說：『{user_msg}』。請以簡短、關懷且語氣溫和的方式進行對話。"
-            fallback = f"收到您的訊息了！天氣多變，記得隨時補充水分、注意保暖喔！"
-            reply_text = safe_gemini_generate(prompt, fallback)
-
-    except Exception as e:
-        print(f"Handle message error: {e}")
-        reply_text = "😊 收到您的訊息！請記得按時記錄健康數據、多喝水喔！"
-
-    # 回覆訊息給長輩端 LINE
-    try:
-        with ApiClient(configuration) as api_client:
-            line_bot_api = MessagingApi(api_client)
-            line_bot_api.reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply_text)]
-                )
-            )
-    except Exception as e:
-        print(f"LINE reply error: {e}")
+        # C. 接收 Quick Reply 的症狀選項並產出客製化卡片
+        elif text.startswith("飲食調查:"):
+            symptom = text.replace("飲食調查:", "")
+            advice = generate_ai_advice("飲食保養", symptom)
+            card = build_flex_card("🥗 今日專屬飲食建議", f"【狀況：{symptom}】\n{advice}")
+            messaging_api.reply_message(ReplyMessageRequest(replyToken=reply_token, messages=[FlexMessage(altText="飲食建議", contents=card)]))
