@@ -1,5 +1,5 @@
 fastapi
 uvicorn
+httpx
 line-bot-sdk
 google-generativeai
-requests
