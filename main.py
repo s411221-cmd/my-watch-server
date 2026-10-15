@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    Configuration, ApiClient, MessagingApi, ReplyMessageRequest,
+    Configuration, ApiClient, MessagingApi, ReplyMessageRequest, PushMessageRequest,
     TextMessage, FlexMessage, FlexContainer, QuickReply, QuickReplyItem, MessageAction
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
@@ -16,16 +16,18 @@ import google.generativeai as genai
 
 # SQLAlchemy 資料庫套件
 from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-# ===== 1. 環境變數與資料庫設定 =====
+# ===== 1. 環境變數設定 =====
 LINE_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://my-watch-server.onrender.com")
 
-# 資料庫連線字串（ Render PostgreSQL 自動設定或本機 SQLite）
+# 💡 家屬的 LINE User ID (請在 Render 環境變數設定 FAMILY_LINE_USER_ID)
+FAMILY_USER_ID = os.getenv("FAMILY_LINE_USER_ID", "")
+
+# 資料庫連線字串
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./health_watch.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -34,7 +36,7 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# ===== 2. 資料庫 Schema 定義 =====
+# ===== 2. 資料庫 Schema =====
 class HealthLog(Base):
     __tablename__ = "health_logs"
 
@@ -54,7 +56,7 @@ def get_db():
     finally:
         db.close()
 
-# LINE 與 AI 初始化
+# SDK 初始化
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
@@ -64,10 +66,37 @@ if GEMINI_KEY:
 else:
     gemini_model = None
 
-# 即時記憶體數據（預設備用值）
-latest_telemetry = {"temp": 36.5, "heart_rate": 75, "spo2": 98, "updated_at": "尚未收到上傳"}
+# ===== 3. 工具函數：讀取最新健康數據 =====
+def get_latest_data(db: Session) -> dict:
+    last_log = db.query(HealthLog).order_by(HealthLog.id.desc()).first()
+    if last_log:
+        return {
+            "watch_id": last_log.watch_id,
+            "temp": last_log.temp,
+            "heart_rate": last_log.heart_rate,
+            "spo2": last_log.spo2,
+            "updated_at": last_log.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        }
+    return {"watch_id": "Watch_001", "temp": 36.5, "heart_rate": 75, "spo2": 98, "updated_at": "尚未收到上傳"}
 
-# ===== 3. 生命週期與 Keep-Alive =====
+# ===== 4. 工具函數：推播緊急訊息給家屬 =====
+def push_to_family(messaging_api: MessagingApi, text_msg: str):
+    target_id = FAMILY_USER_ID
+    if target_id:
+        try:
+            messaging_api.push_message(
+                PushMessageRequest(
+                    to=target_id,
+                    messages=[TextMessage(text=text_msg)]
+                )
+            )
+            print(f"✅ [Push Success] 已發送推播訊息給家屬: {target_id}")
+        except Exception as e:
+            print(f"❌ [Push Error] 發送家屬訊息失敗: {e}")
+    else:
+        print("⚠️ [Push Warning] 未設定 FAMILY_LINE_USER_ID，無法發送訊息給家屬！")
+
+# ===== 5. 生命週期與 Keep-Alive =====
 async def keep_alive_task():
     async with httpx.AsyncClient() as client:
         while True:
@@ -84,29 +113,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# ===== 4. API Endpoints (含方法 2 網頁檢視) =====
+# ===== 6. API Endpoints =====
 
 @app.get("/api/v1/healthz")
 async def health_check():
     return {"status": "healthy", "service": "health-watch-backend"}
 
-# 📥 接收手環數據並存入資料庫
+# 📥 接收手環數據 (若高溫/高心率會自動發送警報給家屬)
 @app.post("/api/v1/telemetry")
 async def receive_telemetry(data: dict, db: Session = Depends(get_db)):
-    global latest_telemetry
     watch_id = data.get("watch_id", "Watch_001")
     temp = float(data.get("temp", 36.5))
     heart_rate = int(data.get("heart_rate", 75))
     spo2 = int(data.get("spo2", 98))
-    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-    latest_telemetry = {
-        "watch_id": watch_id,
-        "temp": temp,
-        "heart_rate": heart_rate,
-        "spo2": spo2,
-        "updated_at": now_str
-    }
 
     try:
         log_entry = HealthLog(
@@ -119,32 +138,37 @@ async def receive_telemetry(data: dict, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(log_entry)
         print(f"✅ [DB Success] 數據已存入 DB ID: {log_entry.id}")
+
+        # 🚨 異常數據自動觸發警報推播給家屬
+        if temp > 38.0 or heart_rate > 120 or spo2 < 90:
+            alert_msg = (
+                f"🚨【長輩健康警訊通知】\n"
+                f"手錶 [{watch_id}] 傳回異常數據！\n\n"
+                f"- 狀態：紅燈\n"
+                f"- 體溫：{temp}°C\n"
+                f"- 血氧：{spo2}%\n"
+                f"- 心率：{heart_rate}bpm\n\n"
+                f"🤖 AI 醫師分析：\n"
+                f"🚨【AI 緊急警告】數據顯示體溫/心率異常，請立即關心長輩狀況！\n\n"
+                f"請儘快確認長輩狀況！"
+            )
+            with ApiClient(configuration) as api_client:
+                messaging_api = MessagingApi(api_client)
+                push_to_family(messaging_api, alert_msg)
+
         return {"status": "success", "saved_id": log_entry.id}
     except Exception as e:
         db.rollback()
         print(f"❌ [DB Error] 寫入資料庫失敗: {e}")
         return {"status": "error", "message": str(e)}
 
-# 🌐 【方法 2】網頁檢視 API：查看最新一筆即時數據
+# 🌐 網頁檢視 API：查看最新一筆即時數據
 @app.get("/api/v1/telemetry/latest")
 async def get_latest_telemetry(db: Session = Depends(get_db)):
-    last_log = db.query(HealthLog).order_by(HealthLog.id.desc()).first()
-    if last_log:
-        return {
-            "status": "success",
-            "source": "database",
-            "data": {
-                "id": last_log.id,
-                "watch_id": last_log.watch_id,
-                "temp": last_log.temp,
-                "heart_rate": last_log.heart_rate,
-                "spo2": last_log.spo2,
-                "created_at": last_log.created_at.strftime("%Y-%m-%d %H:%M:%S")
-            }
-        }
-    return {"status": "success", "source": "memory", "data": latest_telemetry}
+    data = get_latest_data(db)
+    return {"status": "success", "data": data}
 
-# 🌐 【方法 2】網頁檢視 API：查看歷史數據紀錄清單
+# 🌐 網頁檢視 API：查看歷史數據紀錄清單
 @app.get("/api/v1/telemetry/history")
 async def get_telemetry_history(limit: int = 20, db: Session = Depends(get_db)):
     logs = db.query(HealthLog).order_by(HealthLog.id.desc()).limit(limit).all()
@@ -161,11 +185,11 @@ async def get_telemetry_history(limit: int = 20, db: Session = Depends(get_db)):
     ]
     return {"status": "success", "count": len(history_list), "history": history_list}
 
-# ===== 5. AI 與 Flex Message 生成器 =====
+# ===== 7. AI 與 Flex Message 生成器 =====
 
-def generate_ai_advice(category: str, symptom: str = "無症狀") -> str:
-    temp = latest_telemetry["temp"]
-    hr = latest_telemetry["heart_rate"]
+def generate_ai_advice(category: str, symptom: str, data: dict) -> str:
+    temp = data["temp"]
+    hr = data["heart_rate"]
     
     if not gemini_model:
         return f"當前體溫 {temp}°C、心率 {hr} bpm。請保持充足休息與定時補充水分。"
@@ -183,11 +207,11 @@ def generate_ai_advice(category: str, symptom: str = "無症狀") -> str:
         return response.text.strip()
     except Exception as e:
         print(f"❌ [Gemini API Error]: {e}")
-        return f"當前體溫 {temp}°C、心率 {hr} bpm。建議適度休息並補充電解質水分，若感不適請就醫。"
+        return f"當前體溫 {temp}°C、心率 {hr} bpm。建議適度休息並補充電解質水分。"
 
-def build_flex_card(title: str, advice: str) -> FlexContainer:
-    temp = latest_telemetry["temp"]
-    hr = latest_telemetry["heart_rate"]
+def build_flex_card(title: str, advice: str, data: dict) -> FlexContainer:
+    temp = data["temp"]
+    hr = data["heart_rate"]
     bg_color = "#1E88E5" if "運動" in title else "#2E7D32"
 
     card_json = {
@@ -238,9 +262,9 @@ def build_weekly_report_card(db: Session) -> FlexContainer:
     }
     return FlexContainer.from_dict(card_json)
 
-def build_family_contact_card() -> FlexContainer:
-    temp = latest_telemetry["temp"]
-    hr = latest_telemetry["heart_rate"]
+def build_family_contact_card(data: dict) -> FlexContainer:
+    temp = data["temp"]
+    hr = data["heart_rate"]
     status_title = "🟢 生理狀態：正常" if temp <= 37.3 and hr <= 100 else "🔴 生理狀態：高溫/異常警示"
     status_color = "#2E7D32" if temp <= 37.3 and hr <= 100 else "#D32F2F"
 
@@ -260,7 +284,7 @@ def build_family_contact_card() -> FlexContainer:
                         {"type": "text", "text": f"即時手環數據：體溫 {temp}°C | 心率 {hr} bpm", "size": "xs", "color": "#555555", "margin": "xs"}
                     ]
                 },
-                {"type": "text", "text": "已連動長者智慧照護卡，點擊下方按鈕可快速撥打緊急聯絡電話給家屬。", "size": "xs", "color": "#666666", "wrap": True}
+                {"type": "text", "text": "已連動長者智慧照護卡！系統已自動推播關懷訊息給家屬，您也可點擊下方按鈕直接撥打電話。", "size": "xs", "color": "#666666", "wrap": True}
             ]
         },
         "footer": {
@@ -275,7 +299,7 @@ def build_family_contact_card() -> FlexContainer:
     }
     return FlexContainer.from_dict(card_json)
 
-# ===== 6. LINE Webhook 事件處理 =====
+# ===== 8. LINE Webhook 事件處理 =====
 
 @app.post("/callback")
 async def line_callback(request: Request):
@@ -294,13 +318,15 @@ def handle_text(event):
     db = SessionLocal()
 
     try:
+        latest_data = get_latest_data(db)
+
         with ApiClient(configuration) as api_client:
             messaging_api = MessagingApi(api_client)
 
             # 1. 今日適合的運動
             if text in ["今日適合的運動", "今日適合運動"]:
-                advice = generate_ai_advice("運動建議")
-                card = build_flex_card("🏃 今日專屬運動建議", advice)
+                advice = generate_ai_advice("運動建議", "無", latest_data)
+                card = build_flex_card("🏃 今日專屬運動建議", advice, latest_data)
                 messaging_api.reply_message(
                     ReplyMessageRequest(replyToken=reply_token, messages=[FlexMessage(altText="運動建議", contents=card)])
                 )
@@ -321,8 +347,8 @@ def handle_text(event):
             # 2-1. 飲食調查子選單
             elif text.startswith("飲食調查:"):
                 symptom = text.replace("飲食調查:", "")
-                advice = generate_ai_advice("飲食保養", symptom)
-                card = build_flex_card("🥗 今日專屬飲食建議", f"【狀況：{symptom}】\n{advice}")
+                advice = generate_ai_advice("飲食保養", symptom, latest_data)
+                card = build_flex_card("🥗 今日專屬飲食建議", f"【狀況：{symptom}】\n{advice}", latest_data)
                 messaging_api.reply_message(
                     ReplyMessageRequest(replyToken=reply_token, messages=[FlexMessage(altText="飲食建議", contents=card)])
                 )
@@ -336,10 +362,23 @@ def handle_text(event):
 
             # 4. 一鍵聯繫家屬 / 家人健康嗶
             elif text in ["一鍵聯繫家屬", "家人健康嗶", "家人健康"]:
-                card = build_family_contact_card()
+                # A. 回覆給長輩 Flex 卡片
+                card = build_family_contact_card(latest_data)
                 messaging_api.reply_message(
                     ReplyMessageRequest(replyToken=reply_token, messages=[FlexMessage(altText="家人健康與緊急聯繫", contents=card)])
                 )
+
+                # B. 🚨【核心修正】同步推播緊急通知訊息給家屬 LINE 帳號
+                family_notice = (
+                    f"🚨【長輩安危關懷通知】\n"
+                    f"長輩剛才點擊了「一鍵聯繫家屬」！\n\n"
+                    f"📊【即時生理數據】\n"
+                    f"・體溫：{latest_data['temp']} °C\n"
+                    f"・血氧：{latest_data['spo2']} %\n"
+                    f"・心率：{latest_data['heart_rate']} bpm\n\n"
+                    f"請儘速與長輩聯繫關心狀況。"
+                )
+                push_to_family(messaging_api, family_notice)
 
             else:
                 msg = TextMessage(text="您好！請點擊下方圖文選單按鈕，查詢 AI 健康建議、查看健康日記或聯繫家屬！")
