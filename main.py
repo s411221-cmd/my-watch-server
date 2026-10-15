@@ -14,7 +14,7 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import google.generativeai as genai
 
-# SQLAlchemy 資料庫套件
+# SQLAlchemy 資料庫套件 (相容 SQLAlchemy 1.4/2.0+)
 from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
@@ -27,7 +27,7 @@ RENDER_URL = os.getenv("RENDER_EXTERNAL_URL", "https://my-watch-server.onrender.
 # 💡 家屬的 LINE User ID (請在 Render 環境變數設定 FAMILY_LINE_USER_ID)
 FAMILY_USER_ID = os.getenv("FAMILY_LINE_USER_ID", "")
 
-# 資料庫連線字串
+# 資料庫連線字串 (自動把 postgres:// 轉為 postgresql://)
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./health_watch.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -56,7 +56,7 @@ def get_db():
     finally:
         db.close()
 
-# SDK 初始化
+# LINE 與 AI 初始化
 configuration = Configuration(access_token=LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
@@ -162,13 +162,13 @@ async def receive_telemetry(data: dict, db: Session = Depends(get_db)):
         print(f"❌ [DB Error] 寫入資料庫失敗: {e}")
         return {"status": "error", "message": str(e)}
 
-# 🌐 網頁檢視 API：查看最新一筆即時數據
+# 🌐 【方法 2】網頁檢視 API：查看最新一筆即時數據
 @app.get("/api/v1/telemetry/latest")
 async def get_latest_telemetry(db: Session = Depends(get_db)):
     data = get_latest_data(db)
     return {"status": "success", "data": data}
 
-# 🌐 網頁檢視 API：查看歷史數據紀錄清單
+# 🌐 【方法 2】網頁檢視 API：查看歷史數據紀錄清單
 @app.get("/api/v1/telemetry/history")
 async def get_telemetry_history(limit: int = 20, db: Session = Depends(get_db)):
     logs = db.query(HealthLog).order_by(HealthLog.id.desc()).limit(limit).all()
@@ -323,6 +323,20 @@ def handle_text(event):
         with ApiClient(configuration) as api_client:
             messaging_api = MessagingApi(api_client)
 
+            # 💡 【除錯功能】打「我的ID」即可取得正確的 LINE User ID
+            if text.lower() in ["我的id", "id", "myid"]:
+                user_id = event.source.user_id
+                msg_text = (
+                    f"🆔 您的 LINE User ID 為：\n\n{user_id}\n\n"
+                    f"請複製上方這串 ID，至 Render 的 Environment 變數設定為：\n"
+                    f"Key: FAMILY_LINE_USER_ID\n"
+                    f"Value: {user_id}"
+                )
+                messaging_api.reply_message(
+                    ReplyMessageRequest(replyToken=reply_token, messages=[TextMessage(text=msg_text)])
+                )
+                return
+
             # 1. 今日適合的運動
             if text in ["今日適合的運動", "今日適合運動"]:
                 advice = generate_ai_advice("運動建議", "無", latest_data)
@@ -362,13 +376,13 @@ def handle_text(event):
 
             # 4. 一鍵聯繫家屬 / 家人健康嗶
             elif text in ["一鍵聯繫家屬", "家人健康嗶", "家人健康"]:
-                # A. 回覆給長輩 Flex 卡片
+                # A. 回覆長輩 Flex 卡片
                 card = build_family_contact_card(latest_data)
                 messaging_api.reply_message(
                     ReplyMessageRequest(replyToken=reply_token, messages=[FlexMessage(altText="家人健康與緊急聯繫", contents=card)])
                 )
 
-                # B. 🚨【核心修正】同步推播緊急通知訊息給家屬 LINE 帳號
+                # B. 同步推播緊急關懷通知給家屬 LINE 帳號
                 family_notice = (
                     f"🚨【長輩安危關懷通知】\n"
                     f"長輩剛才點擊了「一鍵聯繫家屬」！\n\n"
