@@ -5,7 +5,7 @@ from typing import Optional
 import requests
 from fastapi import FastAPI, Request, HTTPException, Depends
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, Float, DateTime, func
+from sqlalchemy import create_engine, Column, Integer, Float, DateTime, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -20,14 +20,14 @@ LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 FAMILY_BOT_TOKEN = os.getenv("FAMILY_BOT_TOKEN", "")
 FAMILY_LINE_USER_ID = os.getenv("FAMILY_LINE_USER_ID", "")
-ELDER_LINE_USER_ID = os.getenv("ELDER_LINE_USER_ID", "") # 長輩/使用者的 LINE User ID (可選)
+ELDER_LINE_USER_ID = os.getenv("ELDER_LINE_USER_ID", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# ==================== 2. PostgreSQL 資料庫連線 ====================
+# ==================== 2. PostgreSQL 資料庫連線 (新增步數與跌倒) ====================
 engine = create_engine(DATABASE_URL) if DATABASE_URL else None
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine) if engine else None
 Base = declarative_base()
@@ -38,6 +38,8 @@ class HealthLog(Base):
     temperature = Column(Float, nullable=False)
     heart_rate = Column(Integer, nullable=False)
     spo2 = Column(Integer, nullable=False)
+    step_count = Column(Integer, default=0)         # 新增：今日累積步數
+    is_fall = Column(Boolean, default=False)        # 新增：是否跌倒
     created_at = Column(DateTime, default=datetime.utcnow)
 
 if engine:
@@ -55,7 +57,6 @@ def get_db():
 
 # ==================== 3. 天氣與 AI 運動建議模組 ====================
 def get_taiwan_weather():
-    """抓取即時天氣狀況 (免 API Key，預設台北/台灣區域座標)"""
     try:
         url = "https://api.open-meteo.com/v1/forecast?latitude=25.0375&longitude=121.5637&current_weather=true"
         res = requests.get(url, timeout=4)
@@ -79,8 +80,7 @@ def get_taiwan_weather():
     return {"temp": 25.0, "condition": "舒適", "is_rainy": False}
 
 
-def generate_ai_exercise_advice(bpm: int, temp: float, weather_info: dict) -> tuple[str, str]:
-    """結合長輩生理數據與天氣狀況，由 AI 判定運動建議"""
+def generate_ai_exercise_advice(bpm: int, temp: float, weather_info: dict, steps: int = 0) -> tuple[str, str]:
     w_temp = weather_info["temp"]
     w_cond = weather_info["condition"]
     is_rainy = weather_info["is_rainy"]
@@ -90,15 +90,15 @@ def generate_ai_exercise_advice(bpm: int, temp: float, weather_info: dict) -> tu
             import openai
             client = openai.OpenAI(api_key=OPENAI_API_KEY)
             prompt = f"""
-            你是一位銀髮族健康與運動專家。請根據長輩目前的生理數據與戶外天氣，給予今日最安全的運動建議。
-            - 長輩最新心率：{bpm} bpm
-            - 長輩最新體溫：{temp} °C
+            你是一位銀髮族健康與運動專家。請根據長輩目前的生理數據、今日步數與戶外天氣，給予今日最安全的運動建議。
+            - 長輩最新心率：{bpm} bpm | 體溫：{temp} °C
+            - 今日已走步數：{steps} 步
             - 當前天氣：{w_cond}，戶外氣溫 {w_temp}°C，{'正下著雨' if is_rainy else '未下雨'}
 
             請回傳 JSON 格式：
             {{
-              "title": "運動主題 (例如：🏠 室內椅上舒緩伸展 / 🚶 陰涼處公園超慢跑)",
-              "description": "建議內容 (100字以內，說明推薦原因、合適時間與注意事項)"
+              "title": "運動主題",
+              "description": "建議內容 (100字以內)"
             }}
             """
             response = client.chat.completions.create(
@@ -114,19 +114,13 @@ def generate_ai_exercise_advice(bpm: int, temp: float, weather_info: dict) -> tu
 
     if is_rainy:
         title = "🏠 室內客廳椅上運動"
-        desc = f"戶外目前有雨（{w_temp}°C），路面濕滑易摔倒。建議今日在室內進行 15 分鐘抬腿與椅上拉筋，促進血液循環又安全。"
-    elif w_temp >= 30.0:
-        title = "❄️ 晨間/傍晚清涼散步"
-        desc = f"今日戶外氣溫高達 {w_temp}°C 較為炎熱。建議避開中午高溫，改於清晨或傍晚至陰涼處散步 20 分鐘，並請記得多補充水分。"
-    elif w_temp <= 18.0:
-        title = "🧥 溫暖室內毛巾操"
-        desc = f"今日戶外氣溫偏低（僅 {w_temp}°C），血管容易收縮。建議穿足保暖衣物，在室內進行 15 分鐘毛巾操或暖身伸展。"
-    elif bpm > 100:
-        title = "🧘 靜態腹式呼吸放鬆"
-        desc = f"雖然天氣{w_cond}（{w_temp}°C）很適合出門，但檢測到您目前心率稍微偏快（{bpm} bpm）。今日請以靜態深呼吸與手部伸展為主。"
+        desc = f"戶外雨天（{w_temp}°C）路滑易摔。目前累積 {steps} 步，建議今日在室內進行抬腿與椅上拉筋 15 分鐘。"
+    elif steps >= 6000:
+        title = "🧘 靜態伸展與腿部按摩"
+        desc = f"太棒了！今日已累積走達 {steps} 步，運動量充沛。建議今晚進行靜態拉筋與腿部放鬆，避免肌肉痠痛。"
     else:
-        title = "🚶 公園超慢跑與散步"
-        desc = f"今日天氣{w_cond}、氣溫 {w_temp}°C 非常舒適！您的心率也相當穩定（{bpm} bpm），非常適合至附近公園散步或超慢跑 20~30 分鐘。"
+        title = "🚶 公園散步與超慢跑"
+        desc = f"今日天氣{w_cond}（{w_temp}°C），目前已走 {steps} 步。建議可至附近公園再散步 20 分鐘達到目標！"
 
     return title, desc
 
@@ -142,25 +136,71 @@ class TelemetryInput(BaseModel):
     temperature: float
     heart_rate: int
     spo2: int
+    step_count: Optional[int] = 0
+    is_fall: Optional[bool] = False
 
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "Health Care System Backend Active"}
 
-# ==================== 5. 硬體 ESP32 數據接收 API (含雙機器人多重警報推播) ====================
+# ==================== 5. 數據接收 API (含跌倒與多重警報) ====================
 @app.post("/api/v1/telemetry")
 def receive_telemetry(data: TelemetryInput, db: Session = Depends(get_db)):
     if db:
         log = HealthLog(
             temperature=data.temperature,
             heart_rate=data.heart_rate,
-            spo2=data.spo2
+            spo2=data.spo2,
+            step_count=data.step_count,
+            is_fall=data.is_fall
         )
         db.add(log)
         db.commit()
         db.refresh(log)
 
-    # A. 多重異常條件判定 (體溫、心率、血氧)
+    # 1. 最高優先級：突發跌倒緊急警報
+    if data.is_fall:
+        fall_card = FlexSendMessage(
+            alt_text="🚨🚨【突發跌倒緊急警報】",
+            contents={
+                "type": "bubble",
+                "styles": {"header": {"backgroundColor": "#8B0000"}},
+                "header": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": [
+                        {"type": "text", "text": "🚨🚨 突發跌倒警報", "weight": "bold", "color": "#FFFFFF", "size": "xl"}
+                    ]
+                },
+                "body": {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": [
+                        {"type": "text", "text": "⚠️ 偵測到長輩發生疑似摔倒/跌倒衝擊！", "weight": "bold", "color": "#CC0000", "size": "md"},
+                        {"type": "text", "text": "請立即確認長輩狀況，必要時請撥打 119！", "size": "sm", "margin": "sm", "color": "#333333"},
+                        {"type": "separator", "margin": "md"},
+                        {
+                            "type": "text", 
+                            "text": f"📊 當前生理即時數據：\n• 體溫：{data.temperature} °C\n• 心率：{data.heart_rate} bpm\n• 血氧：{data.spo2} %\n• 今日累積步數：{data.step_count} 步", 
+                            "wrap": True, "size": "xs", "color": "#555555", "margin": "md"
+                        }
+                    ]
+                }
+            }
+        )
+        if family_bot_api and FAMILY_LINE_USER_ID:
+            try: family_bot_api.push_message(FAMILY_LINE_USER_ID, fall_card)
+            except Exception as e: print(f"家屬跌倒推播失敗: {e}")
+
+        if elder_bot_api:
+            try:
+                if ELDER_LINE_USER_ID: elder_bot_api.push_message(ELDER_LINE_USER_ID, fall_card)
+                else: elder_bot_api.broadcast(fall_card)
+            except Exception as e: print(f"長輩跌倒推播失敗: {e}")
+
+        return {"status": "alert_sent", "type": "fall_detected"}
+
+    # 2. 一般生理數據異常警報 (體溫、血氧、心率)
     is_alert = False
     alert_reasons = []
 
@@ -177,12 +217,8 @@ def receive_telemetry(data: TelemetryInput, db: Session = Depends(get_db)):
 
     if data.heart_rate > 0 and (data.heart_rate > 120 or data.heart_rate < 50):
         is_alert = True
-        if data.heart_rate > 120:
-            alert_reasons.append(f"💓 心率過快：{data.heart_rate} bpm")
-        else:
-            alert_reasons.append(f"💓 心率過慢：{data.heart_rate} bpm")
+        alert_reasons.append(f"💓 心率異常：{data.heart_rate} bpm")
 
-    # B. 觸發警報時，同步推播給「家屬機器人」與「使用者/長輩機器人」
     if is_alert:
         reasons_text = "\n".join(alert_reasons)
         alert_card = FlexSendMessage(
@@ -201,36 +237,22 @@ def receive_telemetry(data: TelemetryInput, db: Session = Depends(get_db)):
                     "type": "box",
                     "layout": "vertical",
                     "contents": [
-                        {"type": "text", "text": "檢測到生理指標異常：", "weight": "bold", "color": "#D9534F", "size": "sm"},
-                        {"type": "text", "text": reasons_text, "wrap": True, "size": "sm", "margin": "md", "weight": "bold", "color": "#CC0000"},
+                        {"type": "text", "text": reasons_text, "wrap": True, "size": "sm", "weight": "bold", "color": "#CC0000"},
                         {"type": "separator", "margin": "md"},
-                        {
-                            "type": "text", 
-                            "text": f"📊 當前數據概況：\n• 體溫：{data.temperature} °C\n• 心率：{data.heart_rate} bpm\n• 血氧：{data.spo2} %", 
-                            "wrap": True, "size": "xs", "color": "#555555", "margin": "md"
-                        },
-                        {"type": "text", "text": "⚠️ 請關注使用者身體狀況，必要時尋求醫療協助！", "wrap": True, "size": "xs", "color": "#CC0000", "margin": "md", "weight": "bold"}
+                        {"type": "text", "text": f"📊 當前數據：體溫 {data.temperature}°C | 心率 {data.heart_rate}bpm | 血氧 {data.spo2}% | 步數 {data.step_count} 步", "wrap": True, "size": "xs", "color": "#555555", "margin": "md"}
                     ]
                 }
             }
         )
-
-        # 1. 發送給家屬機器人
         if family_bot_api and FAMILY_LINE_USER_ID:
-            try:
-                family_bot_api.push_message(FAMILY_LINE_USER_ID, alert_card)
-            except Exception as e:
-                print(f"家屬機器人推播警報失敗: {e}")
+            try: family_bot_api.push_message(FAMILY_LINE_USER_ID, alert_card)
+            except Exception as e: pass
 
-        # 2. 發送給長輩/使用者機器人
         if elder_bot_api:
             try:
-                if ELDER_LINE_USER_ID:
-                    elder_bot_api.push_message(ELDER_LINE_USER_ID, alert_card)
-                else:
-                    elder_bot_api.broadcast(alert_card) # 若無特指個別 User ID 則廣播發送
-            except Exception as e:
-                print(f"使用者機器人推播警報失敗: {e}")
+                if ELDER_LINE_USER_ID: elder_bot_api.push_message(ELDER_LINE_USER_ID, alert_card)
+                else: elder_bot_api.broadcast(alert_card)
+            except Exception as e: pass
 
     return {"status": "success", "data": data}
 
@@ -251,90 +273,66 @@ def handle_message(event):
     user_id = event.source.user_id
     db = next(get_db()) if SessionLocal else None
 
-    # 1. 查詢 User ID
     if user_text == "我的ID":
-        elder_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=f"您的 LINE User ID 為：\n{user_id}")
-        )
+        elder_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"您的 LINE User ID 為：\n{user_id}"))
         return
 
-    # 2. 一鍵聯繫家屬
+    # 一鍵聯繫家屬
     if user_text == "一鍵聯繫家屬":
-        latest_temp, latest_bpm, latest_spo2 = 36.5, 75, 98
+        latest_temp, latest_bpm, latest_spo2, latest_steps = 36.5, 75, 98, 0
         if db:
             latest_log = db.query(HealthLog).order_by(HealthLog.created_at.desc()).first()
             if latest_log:
                 latest_temp = latest_log.temperature
                 latest_bpm = latest_log.heart_rate
                 latest_spo2 = latest_log.spo2
+                latest_steps = latest_log.step_count
 
-        # 長輩端：藍色卡片
-        elder_blue_card = FlexSendMessage(
-            alt_text="已通知家屬",
-            contents={
-                "type": "bubble",
-                "styles": {"header": {"backgroundColor": "#2B4C7E"}},
-                "header": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "contents": [
-                        {"type": "text", "text": "已成功通知家屬", "weight": "bold", "color": "#FFFFFF", "size": "lg"}
-                    ]
-                },
-                "body": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "contents": [
-                        {"type": "text", "text": "系統已將您的緊急通知傳送給家屬關懷機器人。", "wrap": True, "size": "sm", "color": "#555555"}
-                    ]
-                }
-            }
-        )
-        elder_bot_api.reply_message(event.reply_token, elder_blue_card)
-
-        # 家屬端：黑色警報
-        if family_bot_api and FAMILY_LINE_USER_ID:
-            family_black_card = FlexSendMessage(
-                alt_text="🚨【長輩安危關懷通知】",
+        elder_bot_api.reply_message(
+            event.reply_token,
+            FlexSendMessage(
+                alt_text="已通知家屬",
                 contents={
                     "type": "bubble",
-                    "styles": {"header": {"backgroundColor": "#1A1A1A"}},
-                    "header": {
-                        "type": "box",
-                        "layout": "vertical",
-                        "contents": [
-                            {"type": "text", "text": "🚨【長輩安危關懷通知】", "weight": "bold", "color": "#FF4D4D", "size": "lg"}
-                        ]
-                    },
-                    "body": {
-                        "type": "box",
-                        "layout": "vertical",
-                        "contents": [
-                            {"type": "text", "text": "長輩剛才按下了「一鍵聯繫家屬」！", "weight": "bold", "size": "md"},
-                            {"type": "text", "text": f"目前體溫：{latest_temp} °C", "size": "sm", "margin": "md"},
-                            {"type": "text", "text": f"目前心率：{latest_bpm} bpm", "size": "sm"},
-                            {"type": "text", "text": f"目前血氧：{latest_spo2} %", "size": "sm"}
-                        ]
-                    }
+                    "styles": {"header": {"backgroundColor": "#2B4C7E"}},
+                    "header": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": "已成功通知家屬", "weight": "bold", "color": "#FFFFFF", "size": "lg"}]},
+                    "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": "系統已將您的緊急求助傳送給家屬機器人。", "size": "sm"}]}
                 }
             )
-            try:
-                family_bot_api.push_message(FAMILY_LINE_USER_ID, family_black_card)
-            except Exception as e:
-                print(f"家屬機器人推播失敗: {e}")
+        )
+
+        if family_bot_api and FAMILY_LINE_USER_ID:
+            family_bot_api.push_message(
+                FAMILY_LINE_USER_ID,
+                FlexSendMessage(
+                    alt_text="🚨【長輩安危關懷通知】",
+                    contents={
+                        "type": "bubble",
+                        "styles": {"header": {"backgroundColor": "#1A1A1A"}},
+                        "header": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": "🚨【長輩安危關懷通知】", "weight": "bold", "color": "#FF4D4D", "size": "lg"}]},
+                        "body": {
+                            "type": "box", "layout": "vertical",
+                            "contents": [
+                                {"type": "text", "text": "長輩按下「一鍵聯繫家屬」求助按鈕！", "weight": "bold", "size": "md"},
+                                {"type": "text", "text": f"• 體溫：{latest_temp} °C\n• 心率：{latest_bpm} bpm\n• 血氧：{latest_spo2} %\n• 今日步數：{latest_steps} 步", "size": "sm", "margin": "md"}
+                            ]
+                        }
+                    }
+                )
+            )
         return
 
-    # 3. 本週健康日記
+    # 本週健康日記 (帶出總步數)
     if user_text == "本週健康日記":
         seven_days_ago = datetime.utcnow() - timedelta(days=7)
-        avg_temp, avg_bpm, avg_spo2, log_count = 36.5, 75, 98, 0
+        avg_temp, avg_bpm, avg_spo2, max_steps, log_count = 36.5, 75, 98, 0, 0
 
         if db:
             logs = db.query(
                 func.avg(HealthLog.temperature).label("avg_temp"),
                 func.avg(HealthLog.heart_rate).label("avg_bpm"),
                 func.avg(HealthLog.spo2).label("avg_spo2"),
+                func.max(HealthLog.step_count).label("max_steps"),
                 func.count(HealthLog.id).label("count")
             ).filter(HealthLog.created_at >= seven_days_ago).first()
 
@@ -342,6 +340,7 @@ def handle_message(event):
                 avg_temp = round(logs.avg_temp, 1)
                 avg_bpm = int(logs.avg_bpm)
                 avg_spo2 = int(logs.avg_spo2)
+                max_steps = logs.max_steps or 0
                 log_count = logs.count
 
         weekly_card = FlexSendMessage(
@@ -349,24 +348,16 @@ def handle_message(event):
             contents={
                 "type": "bubble",
                 "styles": {"header": {"backgroundColor": "#2D6A4F"}},
-                "header": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "contents": [
-                        {"type": "text", "text": "📊 近 7 天健康週報", "weight": "bold", "color": "#FFFFFF", "size": "lg"}
-                    ]
-                },
+                "header": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": "📊 近 7 天健康與運動週報", "weight": "bold", "color": "#FFFFFF", "size": "lg"}]},
                 "body": {
-                    "type": "box",
-                    "layout": "vertical",
+                    "type": "box", "layout": "vertical",
                     "contents": [
-                        {"type": "text", "text": f"總量測次數：{log_count} 次", "size": "xs", "color": "#888888"},
-                        {"type": "separator", "margin": "sm"},
-                        {"type": "text", "text": f"平均體溫：{avg_temp} °C", "size": "sm", "margin": "md", "weight": "bold"},
-                        {"type": "text", "text": f"平均心率：{avg_bpm} bpm", "size": "sm", "margin": "xs", "weight": "bold"},
-                        {"type": "text", "text": f"平均血氧：{avg_spo2} %", "size": "sm", "margin": "xs", "weight": "bold"},
+                        {"type": "text", "text": f"平均體溫：{avg_temp} °C", "size": "sm", "weight": "bold"},
+                        {"type": "text", "text": f"平均心率：{avg_bpm} bpm", "size": "sm", "weight": "bold", "margin": "xs"},
+                        {"type": "text", "text": f"平均血氧：{avg_spo2} %", "size": "sm", "weight": "bold", "margin": "xs"},
+                        {"type": "text", "text": f"今日最新步數：{max_steps} 步", "size": "sm", "weight": "bold", "color": "#1B4332", "margin": "xs"},
                         {"type": "separator", "margin": "md"},
-                        {"type": "text", "text": "💡 評語：本週生理指標維持良好，請繼續保持規律作息！", "wrap": True, "size": "xs", "color": "#2D6A4F", "margin": "md"}
+                        {"type": "text", "text": "💡 評語：活動量適中，生理指標良好！", "wrap": True, "size": "xs", "color": "#2D6A4F", "margin": "md"}
                     ]
                 }
             }
@@ -374,89 +365,32 @@ def handle_message(event):
         elder_bot_api.reply_message(event.reply_token, weekly_card)
         return
 
-    # 4. 飲食保養建議
-    if user_text == "飲食保養建議":
-        latest_temp = 36.5
-        if db:
-            latest_log = db.query(HealthLog).order_by(HealthLog.created_at.desc()).first()
-            if latest_log:
-                latest_temp = latest_log.temperature
-
-        diet_tip = "建議補充足量溫開水，並攝取優質蛋白質（如豆腐、蒸魚）與深綠色蔬菜。"
-        if latest_temp >= 37.2:
-            diet_tip = "體溫微偏高，建議多補充水分與電解質，飲食以清淡粥品為主，避免油膩辛辣。"
-
-        diet_card = FlexSendMessage(
-            alt_text="🥗 飲食保養建議",
-            contents={
-                "type": "bubble",
-                "styles": {"header": {"backgroundColor": "#E67E22"}},
-                "header": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "contents": [
-                        {"type": "text", "text": "🥗 今日飲食保養建議", "weight": "bold", "color": "#FFFFFF", "size": "lg"}
-                    ]
-                },
-                "body": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "contents": [
-                        {"type": "text", "text": "【長輩專屬膳食指南】", "weight": "bold", "size": "md", "color": "#E67E22"},
-                        {"type": "text", "text": diet_tip, "wrap": True, "size": "sm", "margin": "md", "color": "#333333"},
-                        {"type": "separator", "margin": "md"},
-                        {"type": "text", "text": "🥛 每日水分建議量：約 1500 - 2000 c.c.", "size": "xs", "color": "#666666", "margin": "sm"},
-                        {"type": "text", "text": "🍎 飯後可搭配一份少糖水果（如蘋果、芭樂）", "size": "xs", "color": "#666666", "margin": "xs"}
-                    ]
-                }
-            }
-        )
-        elder_bot_api.reply_message(event.reply_token, diet_card)
-        return
-
-    # 5. 今日適合的運動 (整合即時天氣 + AI 智慧判斷)
+    # 今日適合的運動 (結合步數 + 天氣 + AI)
     if user_text == "今日適合的運動":
-        latest_bpm = 75
-        latest_temp = 36.5
+        latest_bpm, latest_temp, latest_steps = 75, 36.5, 0
         if db:
             latest_log = db.query(HealthLog).order_by(HealthLog.created_at.desc()).first()
             if latest_log:
                 latest_bpm = latest_log.heart_rate
                 latest_temp = latest_log.temperature
+                latest_steps = latest_log.step_count
 
         weather_info = get_taiwan_weather()
-        ex_title, ex_desc = generate_ai_exercise_advice(latest_bpm, latest_temp, weather_info)
+        ex_title, ex_desc = generate_ai_exercise_advice(latest_bpm, latest_temp, weather_info, latest_steps)
 
         exercise_card = FlexSendMessage(
-            alt_text="🏃 今日運動建議 (天氣+AI分析)",
+            alt_text="🏃 今日運動建議",
             contents={
                 "type": "bubble",
                 "styles": {"header": {"backgroundColor": "#2980B9"}},
-                "header": {
-                    "type": "box",
-                    "layout": "vertical",
-                    "contents": [
-                        {"type": "text", "text": "🏃 AI 天氣運動建議", "weight": "bold", "color": "#FFFFFF", "size": "lg"}
-                    ]
-                },
+                "header": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": "🏃 AI 天氣與步數運動建議", "weight": "bold", "color": "#FFFFFF", "size": "lg"}]},
                 "body": {
-                    "type": "box",
-                    "layout": "vertical",
+                    "type": "box", "layout": "vertical",
                     "contents": [
-                        {
-                            "type": "box",
-                            "layout": "horizontal",
-                            "contents": [
-                                {"type": "text", "text": f"🌤️ 天氣：{weather_info['condition']}", "size": "xs", "color": "#666666"},
-                                {"type": "text", "text": f"🌡️ 氣溫：{weather_info['temp']}°C", "size": "xs", "color": "#666666", "align": "end"}
-                            ]
-                        },
+                        {"type": "text", "text": f"🌤️ 天氣：{weather_info['condition']} ({weather_info['temp']}°C) | 👟 步數：{latest_steps} 步", "size": "xs", "color": "#666666"},
                         {"type": "separator", "margin": "sm"},
                         {"type": "text", "text": ex_title, "weight": "bold", "size": "md", "color": "#2980B9", "margin": "md"},
-                        {"type": "text", "text": ex_desc, "wrap": True, "size": "sm", "margin": "md", "color": "#333333"},
-                        {"type": "separator", "margin": "md"},
-                        {"type": "text", "text": f"📊 生理參考：心率 {latest_bpm} bpm | 體溫 {latest_temp}°C", "size": "xs", "color": "#888888", "margin": "sm"},
-                        {"type": "text", "text": "⚠️ 提醒：請依個人體力調整，如有頭暈不適請立即休息。", "wrap": True, "size": "xs", "color": "#C0392B", "margin": "xs"}
+                        {"type": "text", "text": ex_desc, "wrap": True, "size": "sm", "margin": "md", "color": "#333333"}
                     ]
                 }
             }
@@ -464,7 +398,4 @@ def handle_message(event):
         elder_bot_api.reply_message(event.reply_token, exercise_card)
         return
 
-    elder_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=f"已收到您的訊息：「{user_text}」。請點擊下方選單按鈕使用各項健康服務！")
-    )
+    elder_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"已收到：「{user_text}」"))
